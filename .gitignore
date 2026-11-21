@@ -1,0 +1,9 @@
+# Local runs of the release bot (the GitHub Actions runner is ephemeral,
+# these are only for testing the same commands on your own machine)
+clang-src/
+dist/
+meta/
+*.tar.zst
+*.tar.gz
+*.tar.xz
+*.sha256

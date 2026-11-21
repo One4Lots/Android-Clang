@@ -1,0 +1,784 @@
+name: Android Clang Prebuilt Release Bot
+
+# ============================================================================
+# What this bot does
+# ----------------------------------------------------------------------------
+#  1. Sparse-clones ONLY one clang directory (default: clang-r584948b) from
+#     the `main-kernel` branch of Android's prebuilt clang repo:
+#       https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
+#     using a partial + sparse checkout, so the huge full repo is never
+#     downloaded.
+#  2. Reads the real clang version / host / upstream commit from the binary.
+#  3. Packs it as a `.tar.zst` archive (best size/speed/permission trade-off,
+#     see README) + a `.sha256` checksum file.
+#  4. Publishes a GitHub Release with detailed release notes.
+#  5. (Optional) Sends a Telegram notification with the download link and
+#     link-preview DISABLED (disable_web_page_preview=true).
+#
+# Triggers
+# ----------------------------------------------------------------------------
+#  * Automatically once a week  -> schedule (Friday 00:00 Asia/Dhaka, i.e.
+#                                   Thursday 18:00 UTC — GitHub cron is UTC)
+#  * Manually                    -> workflow_dispatch (Actions tab -> Run workflow)
+#
+# Duplicate protection
+# ----------------------------------------------------------------------------
+#  The release tag is `<clang-dir>-<upstream-short-commit>`, e.g.
+#  `clang-r584948b-0123abcd5678`. On the weekly run, if that exact upstream
+#  snapshot was already released, the job exits cleanly and does NOT create
+#  a duplicate release or send a duplicate Telegram message. Use the manual
+#  `force_release` input to rebuild/replace it anyway.
+#
+# NOTE: GitHub only runs `schedule` workflows from the DEFAULT branch (main),
+# so this file must be merged into `main` for the weekly bot to go live.
+# ============================================================================
+
+on:
+  schedule:
+    # Once a week: Friday 00:00 Bangladesh time (Asia/Dhaka, UTC+6, no DST).
+    # GitHub Actions cron always runs in UTC, so that is Thursday 18:00 UTC.
+    - cron: "0 18 * * 4"
+  workflow_dispatch:
+    inputs:
+      clang_dir:
+        description: "Clang directory to fetch (e.g. clang-r584948b)"
+        required: false
+        default: "clang-r584948b"
+        type: string
+      branch:
+        description: "Upstream branch"
+        required: false
+        default: "main-kernel"
+        type: string
+      auto_detect_latest:
+        description: "Ignore clang_dir and auto-pick the newest clang-* directory on the branch"
+        required: false
+        default: false
+        type: boolean
+      force_release:
+        description: "Rebuild and replace the release even if it already exists"
+        required: false
+        default: false
+        type: boolean
+      zstd_level:
+        description: "zstd compression level (19 = best sensible ratio, 22 = max/slow)"
+        required: false
+        default: "19"
+        type: choice
+        options:
+          - "15"
+          - "19"
+          - "22"
+
+permissions:
+  contents: write # required to create GitHub Releases
+
+concurrency:
+  group: android-clang-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86"
+  # Fallbacks used by the weekly scheduled run (no manual inputs there).
+  # You can override them without editing this file via:
+  #   Settings -> Secrets and variables -> Actions -> Variables
+  #   CLANG_DIR    (e.g. clang-6000000)   [optional]
+  #   CLANG_BRANCH (e.g. main-kernel)     [optional]
+  DEFAULT_CLANG_DIR: "clang-r584948b"
+  DEFAULT_BRANCH: "main-kernel"
+
+jobs:
+  release:
+    name: Fetch, pack and release Android Clang
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      # ------------------------------------------------------------------
+      # 0. Checkout THIS repo (needed so `gh` knows which repo to release to)
+      # ------------------------------------------------------------------
+      - name: Checkout this repository
+        uses: actions/checkout@v7
+
+      # ------------------------------------------------------------------
+      # 1. Resolve effective configuration (manual inputs > repo variables
+      #    > built-in defaults). Inputs are passed via env, never inlined
+      #    into the script, to avoid script-injection issues.
+      # ------------------------------------------------------------------
+      - name: Resolve configuration
+        id: config
+        env:
+          INPUT_CLANG_DIR: ${{ inputs.clang_dir }}
+          INPUT_BRANCH: ${{ inputs.branch }}
+          INPUT_AUTO_DETECT: ${{ inputs.auto_detect_latest }}
+          INPUT_FORCE: ${{ inputs.force_release }}
+          INPUT_ZSTD_LEVEL: ${{ inputs.zstd_level }}
+          VAR_CLANG_DIR: ${{ vars.CLANG_DIR }}
+          VAR_BRANCH: ${{ vars.CLANG_BRANCH }}
+        run: |
+          set -euo pipefail
+
+          CLANG_DIR="${INPUT_CLANG_DIR:-${VAR_CLANG_DIR:-$DEFAULT_CLANG_DIR}}"
+          BRANCH="${INPUT_BRANCH:-${VAR_BRANCH:-$DEFAULT_BRANCH}}"
+          AUTO_DETECT="${INPUT_AUTO_DETECT:-false}"
+          FORCE="${INPUT_FORCE:-false}"
+          ZSTD_LEVEL="${INPUT_ZSTD_LEVEL:-19}"
+
+          # --- Basic validation (single directory name / branch name only) ---
+          if [[ ! "$CLANG_DIR" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Invalid clang_dir '$CLANG_DIR' (expected one directory name, e.g. clang-r584948b)"
+            exit 1
+          fi
+          if [[ ! "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::Invalid branch '$BRANCH'"
+            exit 1
+          fi
+          if [[ ! "$ZSTD_LEVEL" =~ ^([1-9]|1[0-9]|2[0-2])$ ]]; then
+            echo "::error::Invalid zstd level '$ZSTD_LEVEL' (1-22)"
+            exit 1
+          fi
+
+          {
+            echo "clang_dir=$CLANG_DIR"
+            echo "branch=$BRANCH"
+            echo "auto_detect_latest=$AUTO_DETECT"
+            echo "force_release=$FORCE"
+            echo "zstd_level=$ZSTD_LEVEL"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### ⚙️ Configuration"
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| Clang directory | \`$CLANG_DIR\` |"
+            echo "| Upstream branch | \`$BRANCH\` |"
+            echo "| Auto-detect latest | \`$AUTO_DETECT\` |"
+            echo "| Force release | \`$FORCE\` |"
+            echo "| zstd level | \`$ZSTD_LEVEL\` |"
+            echo "| Trigger | \`${{ github.event_name }}\` |"
+            echo "| Weekly schedule | Fri 00:00 Asia/Dhaka (Thu 18:00 UTC) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 2. Tooling + disk space
+      # ------------------------------------------------------------------
+      - name: Install zstd
+        run: |
+          set -euo pipefail
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq zstd
+          fi
+          zstd --version
+          tar --version | head -n 1
+
+      - name: Free up runner disk space
+        run: |
+          set -euo pipefail
+          # Clang is large; the stock runner image ships a lot we don't need.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h /
+
+      # ------------------------------------------------------------------
+      # 3. Sparse partial clone — the exact technique requested:
+      #
+      #    git clone --no-checkout --depth=1 --filter=blob:none \
+      #              --single-branch -b main-kernel <upstream>
+      #    git sparse-checkout set --cone clang-r584948b
+      #    git checkout main-kernel
+      #
+      #    `--cone` is passed explicitly (rather than relying on Git's
+      #    default) so only the named directory — plus files at the repo
+      #    root — is materialised, and the checkout is verified below.
+      # ------------------------------------------------------------------
+      - name: Sparse-checkout the clang directory from AOSP
+        id: source
+        env:
+          CLANG_DIR: ${{ steps.config.outputs.clang_dir }}
+          CLANG_BRANCH: ${{ steps.config.outputs.branch }}
+          AUTO_DETECT: ${{ steps.config.outputs.auto_detect_latest }}
+        run: |
+          set -euo pipefail
+
+          rm -rf clang-src
+          git clone --no-checkout --depth=1 --filter=blob:none \
+            --single-branch -b "$CLANG_BRANCH" \
+            "$UPSTREAM_URL" clang-src
+
+          if [[ "$AUTO_DETECT" == "true" ]]; then
+            LATEST="$(git -C clang-src ls-tree --name-only HEAD \
+                      | grep -E '^clang-' | sort -V | tail -n 1 || true)"
+            if [[ -z "$LATEST" ]]; then
+              echo "::error::Could not auto-detect any clang-* directory on branch '$CLANG_BRANCH'"
+              exit 1
+            fi
+            echo "Auto-detected newest clang directory: $LATEST (was: $CLANG_DIR)"
+            CLANG_DIR="$LATEST"
+          fi
+
+          git -C clang-src sparse-checkout set --cone "$CLANG_DIR"
+          git -C clang-src checkout "$CLANG_BRANCH"
+
+          # ---------- Verify the sparse checkout properly ----------
+          echo "Sparse-checkout mode and patterns:"
+          git -C clang-src sparse-checkout list
+
+          # 1. Cone mode must actually be enabled.
+          CONE_MODE="$(git -C clang-src config --get core.sparseCheckoutCone || echo 'unset')"
+          echo "core.sparseCheckoutCone=$CONE_MODE"
+          if [[ "$CONE_MODE" != "true" ]]; then
+            echo "::error::Sparse checkout is not in cone mode (core.sparseCheckoutCone=$CONE_MODE)"
+            exit 1
+          fi
+
+          # 2. The sparse pattern list must contain exactly our directory.
+          if ! git -C clang-src sparse-checkout list | grep -Fxq "$CLANG_DIR"; then
+            echo "::error::Sparse-checkout list does not contain '$CLANG_DIR':"
+            git -C clang-src sparse-checkout list
+            exit 1
+          fi
+
+          # 3. We must be on the requested branch, tracking the real upstream.
+          CURRENT_BRANCH="$(git -C clang-src symbolic-ref --short -q HEAD || echo 'DETACHED')"
+          REMOTE_URL="$(git -C clang-src remote get-url origin)"
+          echo "Branch: $CURRENT_BRANCH | Remote: $REMOTE_URL"
+          if [[ "$CURRENT_BRANCH" != "$CLANG_BRANCH" ]]; then
+            echo "::error::Expected branch '$CLANG_BRANCH' but HEAD is on '$CURRENT_BRANCH'"
+            exit 1
+          fi
+          if [[ "$REMOTE_URL" != "$UPSTREAM_URL" ]]; then
+            echo "::error::Unexpected remote '$REMOTE_URL' (expected '$UPSTREAM_URL')"
+            exit 1
+          fi
+
+          # 4. The target directory must exist (with available ones listed on failure).
+          if [[ ! -d "clang-src/$CLANG_DIR" ]]; then
+            echo "::error::Directory '$CLANG_DIR' was not checked out — does it exist on branch '$CLANG_BRANCH'?"
+            echo "Available clang-* directories on '$CLANG_BRANCH':"
+            git -C clang-src ls-tree --name-only HEAD | grep -E '^clang-' || true
+            exit 1
+          fi
+
+          # 5. No OTHER clang-* directory may have been checked out.
+          for other in clang-src/clang-*; do
+            [[ -e "$other" ]] || continue
+            if [[ "$(basename "$other")" != "$CLANG_DIR" ]]; then
+              echo "::error::Unexpected extra clang directory checked out: $other (cone mode should only fetch $CLANG_DIR)"
+              exit 1
+            fi
+          done
+
+          # 6. The clang binary must exist.
+          if [[ ! -e "clang-src/$CLANG_DIR/bin/clang" ]]; then
+            echo "::error::clang binary not found at clang-src/$CLANG_DIR/bin/clang"
+            ls -la "clang-src/$CLANG_DIR" || true
+            exit 1
+          fi
+
+          echo "✅ Sparse checkout verified: cone mode, branch '$CLANG_BRANCH', only '$CLANG_DIR' checked out."
+          echo "clang_dir=$CLANG_DIR" >> "$GITHUB_OUTPUT"
+          echo "Checked out contents:"
+          ls -la "clang-src/$CLANG_DIR"
+          du -sh "clang-src/$CLANG_DIR"
+
+      # ------------------------------------------------------------------
+      # 4. Collect metadata for the release notes / tag / Telegram message
+      # ------------------------------------------------------------------
+      - name: Collect clang metadata
+        id: meta
+        env:
+          CLANG_DIR: ${{ steps.source.outputs.clang_dir }}
+          CLANG_BRANCH: ${{ steps.config.outputs.branch }}
+        run: |
+          set -euo pipefail
+          mkdir -p meta dist
+
+          CLANG_PATH="clang-src/$CLANG_DIR"
+          CLANG_BIN="$CLANG_PATH/bin/clang"
+
+          UPSTREAM_SHA="$(git -C clang-src rev-parse HEAD)"
+          SHORT_SHA="${UPSTREAM_SHA:0:12}"
+          COMMIT_DATE="$(git -C clang-src log -1 --format=%cI)"
+          COMMIT_SUBJECT="$(git -C clang-src log -1 --format=%s)"
+          RELEASE_DATE="$(date -u +'%Y-%m-%d %H:%M UTC')"
+          RELEASE_DATE_ISO="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          # --- Real version straight from the shipped binary ---
+          : > meta/clang-version.txt
+          if [[ -x "$CLANG_BIN" ]]; then
+            "$CLANG_BIN" --version > meta/clang-version.txt 2>&1 || true
+          fi
+          if [[ ! -s meta/clang-version.txt ]]; then
+            # Fallback: some prebuilts ship a version text file instead.
+            find "$CLANG_PATH" -maxdepth 2 -iname '*version*.txt' \
+              -exec cat {} \; > meta/clang-version.txt 2>/dev/null || true
+          fi
+          if [[ ! -s meta/clang-version.txt ]]; then
+            echo "Version could not be determined from the binary." > meta/clang-version.txt
+          fi
+          CLANG_VERSION_LINE="$(head -n 1 meta/clang-version.txt)"
+
+          TARGET_TRIPLE=""
+          if [[ -x "$CLANG_BIN" ]]; then
+            TARGET_TRIPLE="$("$CLANG_BIN" --print-target-triple 2>/dev/null || "$CLANG_BIN" -dumpmachine 2>/dev/null || true)"
+          fi
+          [[ -n "$TARGET_TRIPLE" ]] || TARGET_TRIPLE="unknown"
+
+          HOST_OS="$(uname -s) $(uname -m)"
+          if [[ -r /etc/os-release ]]; then
+            # shellcheck disable=SC1091
+            HOST_OS="$(. /etc/os-release && echo "${PRETTY_NAME:-$NAME}") / $(uname -m)"
+          fi
+          BIN_FILE_INFO="$(file "$CLANG_BIN" 2>/dev/null || echo 'unknown')"
+
+          UNCOMPRESSED_SIZE="$(du -sh "$CLANG_PATH" | cut -f1)"
+          FILE_COUNT="$(find "$CLANG_PATH" -type f | wc -l | tr -d ' ')"
+
+          TAG="${CLANG_DIR}-${SHORT_SHA}"
+          ARCHIVE_NAME="${CLANG_DIR}-linux-x86_64-${SHORT_SHA}.tar.zst"
+
+          {
+            echo "TAG=$TAG"
+            echo "ARCHIVE_NAME=$ARCHIVE_NAME"
+            echo "UPSTREAM_SHA=$UPSTREAM_SHA"
+            echo "SHORT_SHA=$SHORT_SHA"
+            echo "COMMIT_DATE=$COMMIT_DATE"
+            echo "COMMIT_SUBJECT=$COMMIT_SUBJECT"
+            echo "RELEASE_DATE=$RELEASE_DATE"
+            echo "RELEASE_DATE_ISO=$RELEASE_DATE_ISO"
+            echo "CLANG_VERSION_LINE=$CLANG_VERSION_LINE"
+            echo "TARGET_TRIPLE=$TARGET_TRIPLE"
+            echo "HOST_OS=$HOST_OS"
+            echo "BIN_FILE_INFO=$BIN_FILE_INFO"
+            echo "UNCOMPRESSED_SIZE=$UNCOMPRESSED_SIZE"
+            echo "FILE_COUNT=$FILE_COUNT"
+          } > meta/meta.env
+
+          {
+            echo "tag=$TAG"
+            echo "archive_name=$ARCHIVE_NAME"
+            echo "upstream_sha=$UPSTREAM_SHA"
+            echo "short_sha=$SHORT_SHA"
+            echo "release_date=$RELEASE_DATE"
+            echo "release_date_iso=$RELEASE_DATE_ISO"
+          } >> "$GITHUB_OUTPUT"
+
+          cat meta/meta.env
+          echo "--- clang --version ---"
+          cat meta/clang-version.txt
+
+      # ------------------------------------------------------------------
+      # 4b. Verify the checked-out toolchain is complete and runnable.
+      #     Fails the job BEFORE spending time compressing/releasing if
+      #     anything is missing, not executable, or suspiciously small.
+      # ------------------------------------------------------------------
+      - name: Verify clang toolchain
+        env:
+          CLANG_DIR: ${{ steps.source.outputs.clang_dir }}
+        run: |
+          set -euo pipefail
+          CLANG_PATH="clang-src/$CLANG_DIR"
+          CLANG_BIN="$CLANG_PATH/bin/clang"
+          fail() { echo "::error::$*"; exit 1; }
+
+          [[ -d "$CLANG_PATH" ]]     || fail "Missing clang directory: $CLANG_PATH"
+          [[ -d "$CLANG_PATH/bin" ]] || fail "Missing bin/ directory in $CLANG_PATH"
+          [[ -d "$CLANG_PATH/lib" ]] || fail "Missing lib/ directory in $CLANG_PATH"
+          [[ -f "$CLANG_BIN" ]]      || fail "bin/clang is not a regular file: $CLANG_BIN"
+          [[ -x "$CLANG_BIN" ]]      || fail "bin/clang is not executable: $CLANG_BIN"
+
+          # clang++ normally ships as a symlink -> clang; it must resolve.
+          if [[ -e "$CLANG_PATH/bin/clang++" ]]; then
+            [[ -x "$CLANG_PATH/bin/clang++" ]] || fail "bin/clang++ exists but is not executable/resolvable"
+          else
+            echo "::warning::bin/clang++ not present in $CLANG_DIR"
+          fi
+          for tool in ld.lld llvm-ar; do
+            [[ -e "$CLANG_PATH/bin/$tool" ]] || echo "::warning::bin/$tool not present in $CLANG_DIR"
+          done
+
+          # A real Android clang prebuilt is hundreds of MB and thousands of
+          # files — anything tiny means the sparse checkout went wrong.
+          SIZE_BYTES="$(du -sb "$CLANG_PATH" | cut -f1)"
+          FILE_COUNT="$(find "$CLANG_PATH" -type f | wc -l | tr -d ' ')"
+          echo "Toolchain size: $SIZE_BYTES bytes in $FILE_COUNT files"
+          [[ "$SIZE_BYTES" -gt 10485760 ]] || fail "Toolchain is suspiciously small ($SIZE_BYTES bytes) — sparse checkout looks incomplete"
+          [[ "$FILE_COUNT" -gt 20 ]]       || fail "Toolchain has suspiciously few files ($FILE_COUNT) — sparse checkout looks incomplete"
+
+          # Broken symlinks are reported (not fatal: a prebuilt may legally
+          # contain a link whose target only exists on the build host).
+          BROKEN="$(find "$CLANG_PATH" -xtype l -print | head -n 20 || true)"
+          if [[ -n "$BROKEN" ]]; then
+            echo "::warning::Broken symlinks found (first 20):"
+            echo "$BROKEN"
+          fi
+
+          # The shipped binary must actually run on this host and report a
+          # clang version + a target triple.
+          VERSION_OUTPUT="$("$CLANG_BIN" --version 2>&1)" || fail "bin/clang --version failed to run"
+          echo "$VERSION_OUTPUT"
+          grep -qi "clang version" <<<"$VERSION_OUTPUT" || fail "bin/clang --version did not report a clang version"
+          TRIPLE="$("$CLANG_BIN" --print-target-triple 2>/dev/null || "$CLANG_BIN" -dumpmachine 2>/dev/null || true)"
+          [[ -n "$TRIPLE" ]] || fail "Could not determine target triple from bin/clang"
+          echo "Target triple: $TRIPLE"
+
+          {
+            echo "### ✅ Toolchain verified"
+            echo "- \`$CLANG_DIR/bin/clang\` is present, executable and runs"
+            echo "- Size: $SIZE_BYTES bytes / $FILE_COUNT files"
+            echo "- Target triple: \`$TRIPLE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 5. Skip early if this exact snapshot is already released
+      # ------------------------------------------------------------------
+      - name: Check whether this release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          FORCE: ${{ steps.config.outputs.force_release }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            if [[ "$FORCE" == "true" ]]; then
+              echo "Release \`$TAG\` already exists but force_release=true — it will be rebuilt and replaced." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "Release \`$TAG\` already exists — skipping (nothing new upstream). Use force_release to rebuild." >> "$GITHUB_STEP_SUMMARY"
+              echo "::notice::Release $TAG already exists. Skipping. Re-run manually with force_release=true to replace it."
+            fi
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Release \`$TAG\` does not exist yet — building it." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ------------------------------------------------------------------
+      # 6. Compress: tar + zstd
+      #    * tar preserves symlinks, permissions and the executable bit,
+      #      which a clang toolchain depends on (zip does not, reliably).
+      #    * zstd -19 gives a much smaller file than gzip/lz4 at a far
+      #      faster decompression speed than xz, and is preinstalled on
+      #      most modern Linux distros. See README for the full comparison.
+      # ------------------------------------------------------------------
+      - name: Compress clang (tar + zstd)
+        if: ${{ steps.check.outputs.exists != 'true' || steps.config.outputs.force_release == 'true' }}
+        env:
+          CLANG_DIR: ${{ steps.source.outputs.clang_dir }}
+          ARCHIVE_NAME: ${{ steps.meta.outputs.archive_name }}
+          ZSTD_LEVEL: ${{ steps.config.outputs.zstd_level }}
+        run: |
+          set -euo pipefail
+
+          ARCHIVE_PATH="dist/$ARCHIVE_NAME"
+          ZSTD_CMD="zstd -T0 -$ZSTD_LEVEL"
+          if [[ "$ZSTD_LEVEL" -ge 20 ]]; then
+            ZSTD_CMD="$ZSTD_CMD --ultra" # levels 20-22 require --ultra
+          fi
+          echo "Compressing $CLANG_DIR -> $ARCHIVE_PATH ($ZSTD_CMD, multi-threaded)"
+          tar --sort=name -cf "$ARCHIVE_PATH" \
+            -I "$ZSTD_CMD" \
+            -C clang-src "$CLANG_DIR"
+
+          (cd dist && sha256sum "$ARCHIVE_NAME" > "$ARCHIVE_NAME.sha256")
+
+          ARCHIVE_BYTES="$(stat -c%s "$ARCHIVE_PATH")"
+          ARCHIVE_HUMAN="$(du -h "$ARCHIVE_PATH" | cut -f1)"
+          SHA256="$(cut -d' ' -f1 "dist/$ARCHIVE_NAME.sha256")"
+
+          {
+            echo "ARCHIVE_BYTES=$ARCHIVE_BYTES"
+            echo "ARCHIVE_HUMAN=$ARCHIVE_HUMAN"
+            echo "SHA256=$SHA256"
+          } >> meta/meta.env
+
+          ls -lh dist/
+          cat "dist/$ARCHIVE_NAME.sha256"
+
+      # ------------------------------------------------------------------
+      # 6b. Verify the archive properly before anything is released:
+      #     checksum, zstd stream integrity, and exact contents.
+      # ------------------------------------------------------------------
+      - name: Verify compressed archive
+        if: ${{ steps.check.outputs.exists != 'true' || steps.config.outputs.force_release == 'true' }}
+        env:
+          CLANG_DIR: ${{ steps.source.outputs.clang_dir }}
+          ARCHIVE_NAME: ${{ steps.meta.outputs.archive_name }}
+        run: |
+          set -euo pipefail
+          ARCHIVE_PATH="dist/$ARCHIVE_NAME"
+          fail() { echo "::error::$*"; exit 1; }
+
+          [[ -s "$ARCHIVE_PATH" ]]             || fail "Archive missing or empty: $ARCHIVE_PATH"
+          [[ -s "$ARCHIVE_PATH.sha256" ]]      || fail "Checksum file missing or empty: $ARCHIVE_PATH.sha256"
+
+          # 1. SHA256 must match the recorded checksum.
+          (cd dist && sha256sum -c "$ARCHIVE_NAME.sha256")
+
+          # 2. The zstd stream itself must be intact end-to-end.
+          zstd -t "$ARCHIVE_PATH"
+
+          # 3. Contents: one top-level dir (ours), containing bin/clang.
+          ARCHIVE_PATH="$ARCHIVE_PATH" CLANG_DIR="$CLANG_DIR" python3 - <<'PY'
+          import os, subprocess, sys
+          archive, clang_dir = os.environ["ARCHIVE_PATH"], os.environ["CLANG_DIR"]
+          listing = subprocess.run(
+              ["tar", "-I", "zstd", "-tf", archive],
+              check=True, capture_output=True, text=True,
+          ).stdout.splitlines()
+          if not listing:
+              sys.exit("::error::Archive is empty")
+          tops = {entry.split("/")[0] for entry in listing}
+          if tops != {clang_dir}:
+              sys.exit(f"::error::Unexpected top-level entries in archive: {sorted(tops)} (expected only {clang_dir})")
+          if f"{clang_dir}/bin/clang" not in listing:
+              sys.exit(f"::error::{clang_dir}/bin/clang not found in archive")
+          if len(listing) < 20:
+              sys.exit(f"::error::Archive has suspiciously few entries ({len(listing)})")
+          print(f"Archive contents OK: {len(listing)} entries under {clang_dir}/, bin/clang present")
+          PY
+
+          {
+            echo "### ✅ Archive verified"
+            echo "- \`$ARCHIVE_NAME\`: SHA256 OK, zstd stream OK, contents OK"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 7. Release notes with all the useful info
+      # ------------------------------------------------------------------
+      - name: Generate release notes
+        if: ${{ steps.check.outputs.exists != 'true' || steps.config.outputs.force_release == 'true' }}
+        env:
+          CLANG_DIR: ${{ steps.source.outputs.clang_dir }}
+          CLANG_BRANCH: ${{ steps.config.outputs.branch }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          ARCHIVE_NAME: ${{ steps.meta.outputs.archive_name }}
+        run: |
+          set -euo pipefail
+
+          # meta/meta.env is plain KEY=raw-value (also parsed by the Telegram
+          # step), so read it key-by-key instead of `source`-ing it — values
+          # contain spaces/parentheses that a shell source would choke on.
+          get_meta() { grep -m 1 "^$1=" meta/meta.env | cut -d '=' -f2- || true; }
+          CLANG_VERSION_LINE="$(get_meta CLANG_VERSION_LINE)"
+          TARGET_TRIPLE="$(get_meta TARGET_TRIPLE)"
+          HOST_OS="$(get_meta HOST_OS)"
+          BIN_FILE_INFO="$(get_meta BIN_FILE_INFO)"
+          UPSTREAM_SHA="$(get_meta UPSTREAM_SHA)"
+          COMMIT_DATE="$(get_meta COMMIT_DATE)"
+          COMMIT_SUBJECT="$(get_meta COMMIT_SUBJECT)"
+          RELEASE_DATE="$(get_meta RELEASE_DATE)"
+          ARCHIVE_HUMAN="$(get_meta ARCHIVE_HUMAN)"
+          ARCHIVE_BYTES="$(get_meta ARCHIVE_BYTES)"
+          UNCOMPRESSED_SIZE="$(get_meta UNCOMPRESSED_SIZE)"
+          FILE_COUNT="$(get_meta FILE_COUNT)"
+          SHA256="$(get_meta SHA256)"
+
+          {
+            echo "# Android Clang \`${CLANG_DIR}\`"
+            echo
+            echo "Prebuilt Android Clang toolchain for **Linux x86_64**, fetched automatically from the official AOSP prebuilts repository — no need to clone the multi-gigabyte full repo yourself."
+            echo
+            echo "## 📋 Details"
+            echo
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| **Clang name** | \`${CLANG_DIR}\` |"
+            echo "| **Clang version** | \`${CLANG_VERSION_LINE}\` |"
+            echo "| **Target triple** | \`${TARGET_TRIPLE}\` |"
+            echo "| **Clang host** | ${HOST_OS} (\`linux-x86_64\`) |"
+            echo "| **Binary type** | \`${BIN_FILE_INFO}\` |"
+            echo "| **Upstream branch** | \`${CLANG_BRANCH}\` |"
+            echo "| **Upstream commit** | [\`${UPSTREAM_SHA}\`](${UPSTREAM_URL}/+/${UPSTREAM_SHA}) |"
+            echo "| **Upstream commit date** | ${COMMIT_DATE} |"
+            echo "| **Upstream commit subject** | ${COMMIT_SUBJECT} |"
+            echo "| **Release date** | ${RELEASE_DATE} |"
+            echo "| **Archive** | \`${ARCHIVE_NAME}\` |"
+            echo "| **Archive size** | ${ARCHIVE_HUMAN} (${ARCHIVE_BYTES} bytes) |"
+            echo "| **Uncompressed size** | ${UNCOMPRESSED_SIZE} (${FILE_COUNT} files) |"
+            echo "| **Compression** | tar + zstd level ${{ steps.config.outputs.zstd_level }} (multi-threaded) |"
+            echo "| **SHA256** | \`${SHA256}\` |"
+            echo
+            echo "## 🔍 Full \`clang --version\`"
+            echo
+            echo '```text'
+            cat meta/clang-version.txt
+            echo '```'
+            echo
+            echo "## ⬇️ Download, verify and use"
+            echo
+            echo '```bash'
+            echo "# 1. Download the archive and its checksum from this release, then verify:"
+            echo "sha256sum -c ${ARCHIVE_NAME}.sha256"
+            echo
+            echo "# 2. Extract (preserves symlinks & executable permissions):"
+            echo "mkdir -p ~/android-clang"
+            echo "tar -I zstd -xvf ${ARCHIVE_NAME} -C ~/android-clang"
+            echo
+            echo "# 3. Use it:"
+            echo "export PATH=\"\$HOME/android-clang/${CLANG_DIR}/bin:\$PATH\""
+            echo "clang --version"
+            echo
+            echo "# Example — build an Android kernel with it:"
+            echo "#   make -j\$(nproc) ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu-"
+            echo '```'
+            echo
+            echo "> **No zstd?** Install it with \`sudo apt install zstd\` (Debian/Ubuntu), \`sudo pacman -S zstd\` (Arch) or \`brew install zstd\` (macOS). Any recent \`tar\` can also read it directly via \`tar --zstd -xvf <file>\`."
+            echo
+            echo "## 📦 Source"
+            echo
+            echo "Automatically packed by the **Android Clang Prebuilt Release Bot** workflow in this repository from:"
+            echo
+            echo "- Repository: ${UPSTREAM_URL}"
+            echo "- Branch: \`${CLANG_BRANCH}\`"
+            echo "- Directory: \`${CLANG_DIR}\`"
+            echo "- Method: \`git clone --no-checkout --depth=1 --filter=blob:none --single-branch -b ${CLANG_BRANCH}\`, \`git sparse-checkout set --cone ${CLANG_DIR}\`, \`git checkout ${CLANG_BRANCH}\` (cone mode verified in CI)"
+            echo
+            echo "---"
+            echo "_This is an unofficial redistribution of Google's Android prebuilt Clang. All rights to the toolchain belong to their respective owners. See the license files inside the archive._"
+          } > dist/RELEASE_NOTES.md
+
+          cat dist/RELEASE_NOTES.md
+
+      # ------------------------------------------------------------------
+      # 8. Publish the GitHub Release
+      # ------------------------------------------------------------------
+      - name: Create GitHub Release
+        id: release
+        if: ${{ steps.check.outputs.exists != 'true' || steps.config.outputs.force_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLANG_DIR: ${{ steps.source.outputs.clang_dir }}
+          CLANG_BRANCH: ${{ steps.config.outputs.branch }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          ARCHIVE_NAME: ${{ steps.meta.outputs.archive_name }}
+          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+          EXISTS: ${{ steps.check.outputs.exists }}
+          FORCE: ${{ steps.config.outputs.force_release }}
+        run: |
+          set -euo pipefail
+
+          # Final pre-flight: never publish a release with missing assets.
+          for f in "dist/$ARCHIVE_NAME" "dist/$ARCHIVE_NAME.sha256" "dist/RELEASE_NOTES.md"; do
+            if [[ ! -s "$f" ]]; then
+              echo "::error::Refusing to release — required file missing or empty: $f"
+              exit 1
+            fi
+          done
+          grep -q "$CLANG_DIR" dist/RELEASE_NOTES.md || { echo "::error::Release notes do not mention $CLANG_DIR"; exit 1; }
+          (cd dist && sha256sum -c "$ARCHIVE_NAME.sha256")
+
+          if [[ "$EXISTS" == "true" && "$FORCE" == "true" ]]; then
+            echo "force_release: deleting previous release $TAG first..."
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+
+          gh release create "$TAG" \
+            "dist/$ARCHIVE_NAME" \
+            "dist/$ARCHIVE_NAME.sha256" \
+            --title "Android Clang $CLANG_DIR ($CLANG_BRANCH @ $SHORT_SHA)" \
+            --notes-file dist/RELEASE_NOTES.md \
+            --latest
+
+          RELEASE_URL="${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG"
+          DOWNLOAD_URL="${{ github.server_url }}/${{ github.repository }}/releases/download/$TAG/$ARCHIVE_NAME"
+          {
+            echo "release_url=$RELEASE_URL"
+            echo "download_url=$DOWNLOAD_URL"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 🚀 Released"
+            echo "- Release: $RELEASE_URL"
+            echo "- Direct download: $DOWNLOAD_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 9. Telegram notification (optional, link preview disabled)
+      #    Requires repository secrets:
+      #      TELEGRAM_BOT_TOKEN  — token from @BotFather
+      #      TELEGRAM_CHAT_ID    — your user / group / channel chat id
+      #    If either is missing the step is skipped quietly (no failure).
+      # ------------------------------------------------------------------
+      - name: Send Telegram notification
+        if: ${{ steps.release.outputs.release_url != '' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CLANG_DIR: ${{ steps.source.outputs.clang_dir }}
+          CLANG_BRANCH: ${{ steps.config.outputs.branch }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          ARCHIVE_NAME: ${{ steps.meta.outputs.archive_name }}
+          RELEASE_DATE: ${{ steps.meta.outputs.release_date }}
+          RELEASE_URL: ${{ steps.release.outputs.release_url }}
+          DOWNLOAD_URL: ${{ steps.release.outputs.download_url }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+            echo "::notice::TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secrets are not set — skipping Telegram notification."
+            echo "Telegram: skipped (secrets not configured)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          python3 - <<'PY'
+          import html
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          def e(value: str) -> str:
+              return html.escape(value or "", quote=True)
+
+          # Re-read the collected metadata.
+          meta = {}
+          with open("meta/meta.env", encoding="utf-8") as fh:
+              for line in fh:
+                  line = line.rstrip("\n")
+                  if "=" in line:
+                      key, value = line.split("=", 1)
+                      meta[key] = value
+
+          text = (
+              "🤖 <b>New Android Clang Release</b>\n"
+              "\n"
+              f"📦 <b>Clang:</b> <code>{e(os.environ['CLANG_DIR'])}</code>\n"
+              f"🔢 <b>Version:</b> <code>{e(meta.get('CLANG_VERSION_LINE', ''))}</code>\n"
+              f"🎯 <b>Target:</b> <code>{e(meta.get('TARGET_TRIPLE', 'unknown'))}</code>\n"
+              f"🖥 <b>Host:</b> {e(meta.get('HOST_OS', 'Linux x86_64'))}\n"
+              f"🌿 <b>Branch:</b> <code>{e(os.environ['CLANG_BRANCH'])}</code>\n"
+              f"🔗 <b>Upstream commit:</b> <code>{e(meta.get('UPSTREAM_SHA', ''))}</code>\n"
+              f"🗓 <b>Released:</b> {e(os.environ['RELEASE_DATE'])}\n"
+              f"🗜 <b>Archive:</b> <code>{e(os.environ['ARCHIVE_NAME'])}</code> ({e(meta.get('ARCHIVE_HUMAN', '?'))})\n"
+              f"🔐 <b>SHA256:</b> <code>{e(meta.get('SHA256', ''))}</code>\n"
+              "\n"
+              f"📄 <a href=\"{e(os.environ['RELEASE_URL'])}\">GitHub Release notes</a>\n"
+              f"⬇️ <a href=\"{e(os.environ['DOWNLOAD_URL'])}\">Direct download (.tar.zst)</a>"
+          )
+
+          payload = urllib.parse.urlencode(
+              {
+                  "chat_id": os.environ["TELEGRAM_CHAT_ID"],
+                  "text": text,
+                  "parse_mode": "HTML",
+                  # <-- The important bit: never show a link preview.
+                  "disable_web_page_preview": "true",
+              }
+          ).encode()
+
+          request = urllib.request.Request(
+              f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage",
+              data=payload,
+              method="POST",
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              result = json.loads(response.read().decode("utf-8"))
+
+          if not result.get("ok"):
+              raise SystemExit(f"Telegram API error: {result}")
+          print("Telegram notification sent (link preview disabled).")
+          PY
+
+          echo "Telegram: notification sent (link preview disabled)." >> "$GITHUB_STEP_SUMMARY"
